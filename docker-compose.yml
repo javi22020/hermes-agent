@@ -1,0 +1,20 @@
+services:
+  hermes:
+    build: .
+    image: hermes-agent:latest
+    restart: unless-stopped
+    volumes:
+      - hermes-data:/data/hermes
+    env_file: .env
+    environment:
+      HERMES_HOME: /data/hermes
+      TERMINAL_ENV: local
+    command: gateway
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  hermes-data:
