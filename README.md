@@ -47,6 +47,47 @@ hermes              # start chatting!
 
 ---
 
+## VPS Deployment (Docker)
+
+Run Hermes as a persistent background service on any VPS or cloud instance — talk to it over Telegram (or Discord/Slack) while it works 24/7.
+
+**Prerequisites:** Docker and Docker Compose installed on the server (Coolify is recommended).
+
+```bash
+git clone --recurse-submodules https://github.com/NousResearch/hermes-agent.git
+cd hermes-agent
+cp .env.docker.example .env
+```
+
+Edit `.env` and fill in at minimum:
+
+| Variable | Description |
+|---|---|
+| `OPENROUTER_API_KEY` | Your OpenRouter (or other provider) API key |
+| `LLM_MODEL` | Model to use, e.g. `anthropic/claude-opus-4.6` |
+| `TELEGRAM_BOT_TOKEN` | Token from [@BotFather](https://t.me/BotFather) |
+| `TELEGRAM_ALLOWED_USERS` | Comma-separated Telegram user IDs allowed to use the bot |
+
+Then start the service:
+
+```bash
+docker compose up -d --build
+docker compose logs -f   # watch startup logs
+```
+
+On first boot the entrypoint bootstraps `config.yaml` and `.env` inside the `/data/hermes` volume, so your settings survive container restarts and upgrades. All sessions, memories, skills, and workspace files are persisted there.
+
+To upgrade:
+
+```bash
+git pull
+docker compose up -d --build
+```
+
+> **Coolify / other PaaS:** the compose file is named `docker-compose.yaml` (with the `.yaml` extension) to match Coolify's default expectation. Set the environment variables directly in your platform's UI instead of using a `.env` file.
+
+---
+
 ## Getting Started
 
 ```bash
