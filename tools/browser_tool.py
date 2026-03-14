@@ -63,9 +63,15 @@ import time
 import requests
 from typing import Dict, Any, Optional, List
 from pathlib import Path
-from agent.auxiliary_client import get_vision_auxiliary_client, get_text_auxiliary_client
+from agent.auxiliary_client import call_llm
 
 logger = logging.getLogger(__name__)
+
+# Standard PATH entries for environments with minimal PATH (e.g. systemd services)
+_SANE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+# Throttle screenshot cleanup to avoid repeated full directory scans.
+_last_screenshot_cleanup_by_dir: dict[str, float] = {}
 
 # ============================================================================
 # Configuration
@@ -80,38 +86,15 @@ DEFAULT_SESSION_TIMEOUT = 300
 # Max tokens for snapshot content before summarization
 SNAPSHOT_SUMMARIZE_THRESHOLD = 8000
 
-# Vision client — for browser_vision (screenshot analysis)
-# Wrapped in try/except so a broken auxiliary config doesn't prevent the entire
-# browser_tool module from importing (which would disable all 10 browser tools).
-try:
-    _aux_vision_client, _DEFAULT_VISION_MODEL = get_vision_auxiliary_client()
-except Exception as _init_err:
-    logger.debug("Could not initialise vision auxiliary client: %s", _init_err)
-    _aux_vision_client, _DEFAULT_VISION_MODEL = None, None
 
-# Text client — for page snapshot summarization (same config as web_extract)
-try:
-    _aux_text_client, _DEFAULT_TEXT_MODEL = get_text_auxiliary_client("web_extract")
-except Exception as _init_err:
-    logger.debug("Could not initialise text auxiliary client: %s", _init_err)
-    _aux_text_client, _DEFAULT_TEXT_MODEL = None, None
-
-# Module-level alias for availability checks
-EXTRACTION_MODEL = _DEFAULT_TEXT_MODEL or _DEFAULT_VISION_MODEL
-
-
-def _get_vision_model() -> str:
+def _get_vision_model() -> Optional[str]:
     """Model for browser_vision (screenshot analysis — multimodal)."""
-    return (os.getenv("AUXILIARY_VISION_MODEL", "").strip()
-            or _DEFAULT_VISION_MODEL
-            or "google/gemini-3-flash-preview")
+    return os.getenv("AUXILIARY_VISION_MODEL", "").strip() or None
 
 
-def _get_extraction_model() -> str:
+def _get_extraction_model() -> Optional[str]:
     """Model for page snapshot text summarization — same as web_extract."""
-    return (os.getenv("AUXILIARY_WEB_EXTRACT_MODEL", "").strip()
-            or _DEFAULT_TEXT_MODEL
-            or "google/gemini-3-flash-preview")
+    return os.getenv("AUXILIARY_WEB_EXTRACT_MODEL", "").strip() or None
 
 
 def _is_local_mode() -> bool:
@@ -241,23 +224,13 @@ def _emergency_cleanup_all_sessions():
         logger.error("Emergency cleanup error: %s", e)
 
 
-def _signal_handler(signum, frame):
-    """Handle interrupt signals to cleanup sessions before exit."""
-    logger.warning("Received signal %s, cleaning up...", signum)
-    _emergency_cleanup_all_sessions()
-    sys.exit(128 + signum)
-
-
-# Register cleanup handlers
+# Register cleanup via atexit only.  Previous versions installed SIGINT/SIGTERM
+# handlers that called sys.exit(), but this conflicts with prompt_toolkit's
+# async event loop — a SystemExit raised inside a key-binding callback
+# corrupts the coroutine state and makes the process unkillable.  atexit
+# handlers run on any normal exit (including sys.exit), so browser sessions
+# are still cleaned up without hijacking signals.
 atexit.register(_emergency_cleanup_all_sessions)
-
-# Only register signal handlers in main process (not in multiprocessing workers)
-try:
-    if os.getpid() == os.getpgrp():  # Main process check
-        signal.signal(signal.SIGINT, _signal_handler)
-        signal.signal(signal.SIGTERM, _signal_handler)
-except (OSError, AttributeError):
-    pass  # Signal handling not available (e.g., Windows or worker process)
 
 
 # =============================================================================
@@ -869,7 +842,6 @@ def _run_browser_command(
         
         browser_env = {**os.environ}
         # Ensure PATH includes standard dirs (systemd services may have minimal PATH)
-        _SANE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
         if "/usr/bin" not in browser_env.get("PATH", "").split(":"):
             browser_env["PATH"] = f"{browser_env.get('PATH', '')}:{_SANE_PATH}"
         browser_env["AGENT_BROWSER_SOCKET_DIR"] = task_socket_dir
@@ -941,9 +913,6 @@ def _extract_relevant_content(
 
     Falls back to simple truncation when no auxiliary text model is configured.
     """
-    if _aux_text_client is None:
-        return _truncate_snapshot(snapshot_text)
-
     if user_task:
         extraction_prompt = (
             f"You are a content extractor for a browser automation agent.\n\n"
@@ -968,13 +937,16 @@ def _extract_relevant_content(
         )
 
     try:
-        from agent.auxiliary_client import auxiliary_max_tokens_param
-        response = _aux_text_client.chat.completions.create(
-            model=_get_extraction_model(),
-            messages=[{"role": "user", "content": extraction_prompt}],
-            **auxiliary_max_tokens_param(4000),
-            temperature=0.1,
-        )
+        call_kwargs = {
+            "task": "web_extract",
+            "messages": [{"role": "user", "content": extraction_prompt}],
+            "max_tokens": 4000,
+            "temperature": 0.1,
+        }
+        model = _get_extraction_model()
+        if model:
+            call_kwargs["model"] = model
+        response = call_llm(**call_kwargs)
         return response.choices[0].message.content
     except Exception:
         return _truncate_snapshot(snapshot_text)
@@ -1497,14 +1469,6 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
     
     effective_task_id = task_id or "default"
     
-    # Check auxiliary vision client
-    if _aux_vision_client is None or _DEFAULT_VISION_MODEL is None:
-        return json.dumps({
-            "success": False,
-            "error": "Browser vision unavailable: no auxiliary vision model configured. "
-                     "Set OPENROUTER_API_KEY or configure Nous Portal to enable browser vision."
-        }, ensure_ascii=False)
-    
     # Save screenshot to persistent location so it can be shared with users
     hermes_home = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
     screenshots_dir = hermes_home / "browser_screenshots"
@@ -1562,14 +1526,13 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
             f"Focus on answering the user's specific question."
         )
 
-        # Use the sync auxiliary vision client directly
-        from agent.auxiliary_client import auxiliary_max_tokens_param
+        # Use the centralized LLM router
         vision_model = _get_vision_model()
-        logger.debug("browser_vision: analysing screenshot (%d bytes) with model=%s",
-                     len(image_data), vision_model)
-        response = _aux_vision_client.chat.completions.create(
-            model=vision_model,
-            messages=[
+        logger.debug("browser_vision: analysing screenshot (%d bytes)",
+                     len(image_data))
+        call_kwargs = {
+            "task": "vision",
+            "messages": [
                 {
                     "role": "user",
                     "content": [
@@ -1578,9 +1541,12 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
                     ],
                 }
             ],
-            **auxiliary_max_tokens_param(2000),
-            temperature=0.1,
-        )
+            "max_tokens": 2000,
+            "temperature": 0.1,
+        }
+        if vision_model:
+            call_kwargs["model"] = vision_model
+        response = call_llm(**call_kwargs)
         
         analysis = response.choices[0].message.content
         response_data = {
@@ -1607,8 +1573,17 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
 
 
 def _cleanup_old_screenshots(screenshots_dir, max_age_hours=24):
-    """Remove browser screenshots older than max_age_hours to prevent disk bloat."""
-    import time
+    """Remove browser screenshots older than max_age_hours to prevent disk bloat.
+
+    Throttled to run at most once per hour per directory to avoid repeated
+    scans on screenshot-heavy workflows.
+    """
+    key = str(screenshots_dir)
+    now = time.time()
+    if now - _last_screenshot_cleanup_by_dir.get(key, 0.0) < 3600:
+        return
+    _last_screenshot_cleanup_by_dir[key] = now
+
     try:
         cutoff = time.time() - (max_age_hours * 3600)
         for f in screenshots_dir.glob("browser_screenshot_*.png"):

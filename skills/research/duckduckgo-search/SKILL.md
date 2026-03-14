@@ -8,6 +8,9 @@ metadata:
   hermes:
     tags: [search, duckduckgo, web-search, free, fallback]
     related_skills: [arxiv]
+    fallback_for_toolsets: [web]
+prerequisites:
+  commands: [ddgs]
 ---
 
 # DuckDuckGo Search

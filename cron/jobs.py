@@ -168,16 +168,22 @@ def parse_schedule(schedule: str) -> Dict[str, Any]:
 
 
 def _ensure_aware(dt: datetime) -> datetime:
-    """Make a naive datetime tz-aware using the configured timezone.
+    """Return a timezone-aware datetime in Hermes configured timezone.
 
-    Handles backward compatibility: timestamps stored before timezone support
-    are naive (server-local).  We assume they were in the same timezone as
-    the current configuration so comparisons work without crashing.
+    Backward compatibility:
+    - Older stored timestamps may be naive.
+    - Naive values are interpreted as *system-local wall time* (the timezone
+      `datetime.now()` used when they were created), then converted to the
+      configured Hermes timezone.
+
+    This preserves relative ordering for legacy naive timestamps across
+    timezone changes and avoids false not-due results.
     """
+    target_tz = _hermes_now().tzinfo
     if dt.tzinfo is None:
-        tz = _hermes_now().tzinfo
-        return dt.replace(tzinfo=tz)
-    return dt
+        local_tz = datetime.now().astimezone().tzinfo
+        return dt.replace(tzinfo=local_tz).astimezone(target_tz)
+    return dt.astimezone(target_tz)
 
 
 def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None) -> Optional[str]:
@@ -425,8 +431,19 @@ def save_job_output(job_id: str, output: str):
     timestamp = _hermes_now().strftime("%Y-%m-%d_%H-%M-%S")
     output_file = job_output_dir / f"{timestamp}.md"
     
-    with open(output_file, 'w', encoding='utf-8') as f:
-        f.write(output)
-    _secure_file(output_file)
+    fd, tmp_path = tempfile.mkstemp(dir=str(job_output_dir), suffix='.tmp', prefix='.output_')
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write(output)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, output_file)
+        _secure_file(output_file)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
     
     return output_file

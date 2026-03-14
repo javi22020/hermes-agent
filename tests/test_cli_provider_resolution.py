@@ -162,6 +162,22 @@ def test_runtime_resolution_rebuilds_agent_on_routing_change(monkeypatch):
     assert shell.api_mode == "codex_responses"
 
 
+def test_cli_prefers_config_provider_over_stale_env_override(monkeypatch):
+    cli = _import_cli()
+
+    monkeypatch.setenv("HERMES_INFERENCE_PROVIDER", "openrouter")
+    config_copy = dict(cli.CLI_CONFIG)
+    model_copy = dict(config_copy.get("model", {}))
+    model_copy["provider"] = "custom"
+    model_copy["base_url"] = "https://api.fireworks.ai/inference/v1"
+    config_copy["model"] = model_copy
+    monkeypatch.setattr(cli, "CLI_CONFIG", config_copy)
+
+    shell = cli.HermesCLI(model="fireworks/minimax-m2p5", compact=True, max_turns=1)
+
+    assert shell.requested_provider == "custom"
+
+
 def test_codex_provider_replaces_incompatible_default_model(monkeypatch):
     """When provider resolves to openai-codex and no model was explicitly
     chosen, the global config default (e.g. anthropic/claude-opus-4.6) must
@@ -197,21 +213,28 @@ def test_codex_provider_replaces_incompatible_default_model(monkeypatch):
     assert shell.model == "gpt-5.2-codex"
 
 
-def test_codex_provider_trusts_explicit_envvar_model(monkeypatch):
-    """When the user explicitly sets LLM_MODEL, we trust their choice and
-    let the API be the judge — even if it's a non-OpenAI model.  Only
-    provider prefixes are stripped; the bare model passes through."""
+def test_codex_provider_uses_config_model(monkeypatch):
+    """Model comes from config.yaml, not LLM_MODEL env var.
+    Config.yaml is the single source of truth to avoid multi-agent conflicts."""
     cli = _import_cli()
 
-    monkeypatch.setenv("LLM_MODEL", "claude-opus-4-6")
+    # LLM_MODEL env var should be IGNORED (even if set)
+    monkeypatch.setenv("LLM_MODEL", "should-be-ignored")
     monkeypatch.delenv("OPENAI_MODEL", raising=False)
+
+    # Set model via config
+    monkeypatch.setitem(cli.CLI_CONFIG, "model", {
+        "default": "gpt-5.2-codex",
+        "provider": "openai-codex",
+        "base_url": "https://chatgpt.com/backend-api/codex",
+    })
 
     def _runtime_resolve(**kwargs):
         return {
             "provider": "openai-codex",
             "api_mode": "codex_responses",
             "base_url": "https://chatgpt.com/backend-api/codex",
-            "api_key": "test-key",
+            "api_key": "fake-codex-token",
             "source": "env/config",
         }
 
@@ -220,11 +243,12 @@ def test_codex_provider_trusts_explicit_envvar_model(monkeypatch):
 
     shell = cli.HermesCLI(compact=True, max_turns=1)
 
-    assert shell._model_is_default is False
     assert shell._ensure_runtime_credentials() is True
     assert shell.provider == "openai-codex"
-    # User explicitly chose this model — it passes through untouched
-    assert shell.model == "claude-opus-4-6"
+    # Model from config (may be normalized by codex provider logic)
+    assert "codex" in shell.model.lower()
+    # LLM_MODEL env var is NOT used
+    assert shell.model != "should-be-ignored"
 
 
 def test_codex_provider_preserves_explicit_codex_model(monkeypatch):

@@ -103,6 +103,7 @@ def _deliver_result(job: dict, content: str) -> None:
         "slack": Platform.SLACK,
         "whatsapp": Platform.WHATSAPP,
         "signal": Platform.SIGNAL,
+        "email": Platform.EMAIL,
     }
     platform = platform_map.get(platform_name.lower())
     if not platform:
@@ -155,6 +156,15 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     """
     from run_agent import AIAgent
     
+    # Initialize SQLite session store so cron job messages are persisted
+    # and discoverable via session_search (same pattern as gateway/run.py).
+    _session_db = None
+    try:
+        from hermes_state import SessionDB
+        _session_db = SessionDB()
+    except Exception as e:
+        logger.debug("Job '%s': SQLite session store not available: %s", job.get("id", "?"), e)
+    
     job_id = job["id"]
     job_name = job["name"]
     prompt = job["prompt"]
@@ -179,7 +189,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         except UnicodeDecodeError:
             load_dotenv(str(_hermes_home / ".env"), override=True, encoding="latin-1")
 
-        model = os.getenv("HERMES_MODEL") or os.getenv("LLM_MODEL") or "anthropic/claude-opus-4.6"
+        model = os.getenv("HERMES_MODEL") or "anthropic/claude-opus-4.6"
 
         # Load config.yaml for model, reasoning, prefill, toolsets, provider routing
         _cfg = {}
@@ -259,7 +269,9 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             providers_order=pr.get("order"),
             provider_sort=pr.get("sort"),
             quiet_mode=True,
-            session_id=f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
+            platform="cron",
+            session_id=f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}",
+            session_db=_session_db,
         )
         
         result = agent.run_conversation(prompt)
@@ -314,6 +326,11 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # Clean up injected env vars so they don't leak to other jobs
         for key in ("HERMES_SESSION_PLATFORM", "HERMES_SESSION_CHAT_ID", "HERMES_SESSION_CHAT_NAME"):
             os.environ.pop(key, None)
+        if _session_db:
+            try:
+                _session_db.close()
+            except Exception as e:
+                logger.debug("Job '%s': failed to close SQLite session store: %s", job_id, e)
 
 
 def tick(verbose: bool = True) -> int:
